@@ -1,106 +1,58 @@
 use anyhow::{Context, Result};
-use indexmap::IndexMap;
 use quote::quote;
 use std::fs;
 use std::path::{Path, PathBuf};
-use syn::{File, Item, ItemMod, Type};
+use syn::{File, Item, ItemMod};
 
-fn split_file(input_path: &Path, output_dir: &Path) -> Result<()> {
+/// Simple and safe module extraction that maintains exact compatibility
+fn extract_modules(input_path: &Path, output_dir: &Path) -> Result<()> {
     println!("Reading {}...", input_path.display());
     let content = fs::read_to_string(input_path)
         .with_context(|| format!("Failed to read {}", input_path.display()))?;
     
     println!("Parsing file with syn (this may take a moment)...");
-    let ast = syn::parse_file(&content)
+    let mut ast = syn::parse_file(&content)
         .with_context(|| "Failed to parse Rust file")?;
     
     println!("Successfully parsed {} items", ast.items.len());
     
-    // Categorize items
-    let mut modules: IndexMap<String, Vec<Item>> = IndexMap::new();
+    // Find and extract inline modules
     let mut types_module: Option<ItemMod> = None;
     let mut builder_module: Option<ItemMod> = None;
-    let mut client_items = Vec::new();
-    let mut common_items = Vec::new();
+    let mut extracted_count = 0;
     
-    println!("Categorizing items...");
-    for item in ast.items {
-        match &item {
-            Item::Mod(m) if m.ident == "types" => {
-                println!("  Found types module");
+    println!("Extracting inline modules...");
+    
+    // First pass: identify modules to extract
+    for item in &ast.items {
+        if let Item::Mod(m) = item {
+            if m.ident == "types" && m.content.is_some() {
+                println!("  Found inline types module");
                 types_module = Some(m.clone());
-            }
-            Item::Mod(m) if m.ident == "builder" => {
-                println!("  Found builder module");
+                extracted_count += 1;
+            } else if m.ident == "builder" && m.content.is_some() {
+                println!("  Found inline builder module");
                 builder_module = Some(m.clone());
-            }
-            Item::Struct(s) => {
-                let name = s.ident.to_string();
-                if name == "Client" {
-                    client_items.push(item);
-                } else if let Some(module) = extract_module_name(&name) {
-                    modules.entry(module).or_default().push(item);
-                } else {
-                    common_items.push(item);
-                }
-            }
-            Item::Enum(e) => {
-                let name = e.ident.to_string();
-                if let Some(module) = extract_module_name(&name) {
-                    modules.entry(module).or_default().push(item);
-                } else {
-                    common_items.push(item);
-                }
-            }
-            Item::Type(t) => {
-                let name = t.ident.to_string();
-                if let Some(module) = extract_module_name(&name) {
-                    modules.entry(module).or_default().push(item);
-                } else {
-                    common_items.push(item);
-                }
-            }
-            Item::Impl(i) => {
-                if let Type::Path(type_path) = &*i.self_ty {
-                    if let Some(segment) = type_path.path.segments.last() {
-                        let name = segment.ident.to_string();
-                        if name == "Client" {
-                            client_items.push(item);
-                        } else if let Some(module) = extract_module_name(&name) {
-                            modules.entry(module).or_default().push(item);
-                        } else {
-                            common_items.push(item);
-                        }
-                    } else {
-                        common_items.push(item);
-                    }
-                } else {
-                    common_items.push(item);
-                }
-            }
-            Item::Use(_) | Item::ExternCrate(_) => {
-                common_items.push(item);
-            }
-            _ => {
-                common_items.push(item);
+                extracted_count += 1;
             }
         }
     }
     
-    println!("Found {} distinct modules", modules.len());
+    if extracted_count == 0 {
+        println!("No inline modules found to extract");
+        return Ok(());
+    }
     
     // Create output directory
     fs::create_dir_all(output_dir)?;
     
-    println!("Writing module files...");
-    
-    // Write types module
+    // Write extracted modules as separate files
     if let Some(types_mod) = &types_module {
-        println!("  Writing types.rs...");
+        println!("Writing types.rs...");
         let types_path = output_dir.join("types.rs");
         
-        // Extract the content from the module
         if let Some((_, items)) = &types_mod.content {
+            // Write the inner content of the module
             let tokens = quote! { #(#items)* };
             let file = syn::parse2::<File>(tokens)?;
             let formatted = prettyplease::unparse(&file);
@@ -108,13 +60,12 @@ fn split_file(input_path: &Path, output_dir: &Path) -> Result<()> {
         }
     }
     
-    // Write builder module
     if let Some(builder_mod) = &builder_module {
-        println!("  Writing builder.rs...");
+        println!("Writing builder.rs...");
         let builder_path = output_dir.join("builder.rs");
         
-        // Extract the content from the module
         if let Some((_, items)) = &builder_mod.content {
+            // Write the inner content of the module
             let tokens = quote! { #(#items)* };
             let file = syn::parse2::<File>(tokens)?;
             let formatted = prettyplease::unparse(&file);
@@ -122,145 +73,39 @@ fn split_file(input_path: &Path, output_dir: &Path) -> Result<()> {
         }
     }
     
-    // Write common module
-    if !common_items.is_empty() {
-        println!("  Writing common.rs ({} items)...", common_items.len());
-        let common_path = output_dir.join("common.rs");
-        write_items_to_file(&common_path, &common_items)?;
-    }
-    
-    // Write client module
-    if !client_items.is_empty() {
-        println!("  Writing client.rs ({} items)...", client_items.len());
-        let client_path = output_dir.join("client.rs");
-        write_items_to_file(&client_path, &client_items)?;
-    }
-    
-    // Write individual modules
-    for (name, items) in &modules {
-        if !items.is_empty() {
-            println!("  Writing {}.rs ({} items)...", name, items.len());
-            let module_path = output_dir.join(format!("{}.rs", name));
-            write_items_to_file(&module_path, &items)?;
-        }
-    }
-    
-    // Generate new lib.rs
-    println!("Writing lib.rs...");
-    write_lib_file(
-        output_dir, 
-        &modules, 
-        types_module.is_some(),
-        builder_module.is_some(),
-        !common_items.is_empty(),
-        !client_items.is_empty()
-    )?;
-    
-    Ok(())
-}
-
-fn extract_module_name(ident: &str) -> Option<String> {
-    // Skip Client-related items
-    if ident == "Client" || ident.starts_with("Client") {
-        return None;
-    }
-    
-    // Extract first word from CamelCase
-    let mut result = String::new();
-    let mut chars = ident.chars();
-    
-    if let Some(first) = chars.next() {
-        if !first.is_uppercase() {
-            return None;
-        }
-        result.push(first.to_lowercase().next().unwrap());
-        
-        for ch in chars {
-            if ch.is_uppercase() {
-                break;
+    // Second pass: replace inline modules with module declarations
+    let mut new_items = Vec::new();
+    for item in ast.items {
+        match &item {
+            Item::Mod(m) if m.ident == "types" && types_module.is_some() => {
+                // Replace inline module with declaration
+                let mod_decl: Item = syn::parse_quote! {
+                    pub mod types;
+                };
+                new_items.push(mod_decl);
             }
-            result.push(ch.to_lowercase().next().unwrap());
+            Item::Mod(m) if m.ident == "builder" && builder_module.is_some() => {
+                // Replace inline module with declaration
+                let mod_decl: Item = syn::parse_quote! {
+                    pub mod builder;
+                };
+                new_items.push(mod_decl);
+            }
+            _ => {
+                // Keep all other items as-is
+                new_items.push(item);
+            }
         }
     }
     
-    if result.is_empty() || result == "client" {
-        None
-    } else {
-        Some(result)
-    }
-}
-
-fn write_items_to_file(path: &Path, items: &[Item]) -> Result<()> {
-    let tokens = quote! {
-        #(#items)*
-    };
-    
-    let file = syn::parse2::<File>(tokens)?;
-    let formatted = prettyplease::unparse(&file);
-    fs::write(path, formatted)?;
-    
-    Ok(())
-}
-
-fn write_lib_file(
-    output_dir: &Path,
-    modules: &IndexMap<String, Vec<Item>>,
-    has_types: bool,
-    has_builder: bool,
-    has_common: bool,
-    has_client: bool,
-) -> Result<()> {
+    // Write the modified lib.rs
+    println!("Writing updated lib.rs...");
     let lib_path = output_dir.join("lib.rs");
     
-    let mut module_names: Vec<String> = modules.keys()
-        .filter(|k| !modules[*k].is_empty())
-        .cloned()
-        .collect();
-    module_names.sort();
-    
-    let mut lib_content = String::new();
-    lib_content.push_str("#![allow(unused_imports)]\n");
-    lib_content.push_str("#![allow(clippy::all)]\n\n");
-    
-    // Module declarations
-    if has_common {
-        lib_content.push_str("pub mod common;\n");
-    }
-    if has_types {
-        lib_content.push_str("pub mod types;\n");
-    }
-    if has_builder {
-        lib_content.push_str("pub mod builder;\n");
-    }
-    if has_client {
-        lib_content.push_str("pub mod client;\n");
-    }
-    
-    for name in &module_names {
-        lib_content.push_str(&format!("pub mod {};\n", name));
-    }
-    
-    lib_content.push('\n');
-    
-    // Re-exports
-    if has_common {
-        lib_content.push_str("pub use common::*;\n");
-    }
-    if has_types {
-        lib_content.push_str("pub use types::*;\n");
-    }
-    if has_builder {
-        lib_content.push_str("pub use builder::*;\n");
-    }
-    if has_client {
-        lib_content.push_str("pub use client::*;\n");
-    }
-    
-    for name in &module_names {
-        lib_content.push_str(&format!("pub use {}::*;\n", name));
-    }
-    
-    fs::write(lib_path, lib_content)?;
+    ast.items = new_items;
+    let tokens = quote! { #ast };
+    let formatted = prettyplease::unparse(&syn::parse2(tokens)?);
+    fs::write(lib_path, formatted)?;
     
     Ok(())
 }
@@ -275,21 +120,26 @@ fn main() -> Result<()> {
         return Ok(());
     }
     
-    // Backup original
+    // Backup original if not already done
     let backup_path = output_dir.join("lib.rs.original");
     if !backup_path.exists() {
         println!("Backing up original lib.rs...");
         fs::copy(&input_path, &backup_path)?;
+    } else {
+        // Restore from backup to ensure clean state
+        println!("Restoring from backup for clean extraction...");
+        fs::copy(&backup_path, &input_path)?;
     }
     
-    println!("Starting full AST-based module splitter using syn and prettyplease...");
-    println!("This will parse the entire file properly and split it into modules.\n");
+    println!("Starting safe module extraction using syn and prettyplease...");
+    println!("This will extract inline modules without changing any namespaces.\n");
     
     let start = std::time::Instant::now();
-    split_file(&input_path, &output_dir)?;
+    extract_modules(&input_path, &output_dir)?;
     let duration = start.elapsed();
     
-    println!("\nModule splitting complete in {:.2}s!", duration.as_secs_f64());
+    println!("\nModule extraction complete in {:.2}s!", duration.as_secs_f64());
+    println!("The code structure is preserved exactly - no namespace changes.");
     println!("Original backed up as lib.rs.original");
     
     Ok(())
