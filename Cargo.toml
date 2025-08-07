@@ -3,7 +3,7 @@ resolver = "2"
 members = [
   "generator",
   "sdk"
-]
+, "splitter"]
 
 [workspace.package]
 version = "0.1.0"
