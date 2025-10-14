@@ -2,10 +2,10 @@
 resolver = "2"
 members = [
   "generator",
-  "sdk"
-, "splitter"]
+  "sdk",
+  "cli",
+]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-
