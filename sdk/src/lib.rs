@@ -431650,7 +431650,14 @@ pub mod builder {
         }
 
         ///Sends a `GET` request to `/vnet_dns_zone_records`
-        pub async fn send(self) -> Result<ResponseValue<()>, Error<types::ErrResponse>> {
+        pub async fn send(
+            self,
+        ) -> Result<
+            ResponseValue<
+                ::std::vec::Vec<::serde_json::Map<::std::string::String, ::serde_json::Value>>,
+            >,
+            Error<types::ErrResponse>,
+        > {
             let Self {
                 client,
                 fields,
@@ -431693,7 +431700,7 @@ pub mod builder {
             client.post(&result, &info).await?;
             let response = result?;
             match response.status().as_u16() {
-                200u16 => Ok(ResponseValue::empty(response)),
+                200u16 => ResponseValue::from_response(response).await,
                 404u16 => Err(Error::ErrorResponse(
                     ResponseValue::from_response(response).await?,
                 )),
