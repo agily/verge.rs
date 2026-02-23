@@ -297331,6 +297331,13 @@ pub mod types {
     }
 }
 
+// Определяем тип клиента в зависимости от фичи
+#[cfg(feature = "middleware")]
+type HttpClient = reqwest_middleware::ClientWithMiddleware;
+
+#[cfg(not(feature = "middleware"))]
+type HttpClient = reqwest::Client;
+
 #[derive(Clone, Debug)]
 ///Client for Verge.io API
 ///
@@ -297341,7 +297348,7 @@ pub mod types {
 ///Version: 4.0
 pub struct Client {
     pub(crate) baseurl: String,
-    pub(crate) client: reqwest::Client,
+    pub(crate) client: HttpClient,
 }
 
 impl Client {
@@ -297352,24 +297359,34 @@ impl Client {
     /// as well as port and a path stem if applicable.
     pub fn new(baseurl: &str) -> Self {
         #[cfg(not(target_arch = "wasm32"))]
-        let client = {
+        let reqwest_client = {
             let dur = std::time::Duration::from_secs(15);
             reqwest::ClientBuilder::new()
                 .connect_timeout(dur)
                 .timeout(dur)
+                .build()
+                .unwrap()
         };
+
         #[cfg(target_arch = "wasm32")]
-        let client = reqwest::ClientBuilder::new();
-        Self::new_with_client(baseurl, client.build().unwrap())
+        let reqwest_client = reqwest::ClientBuilder::new().build().unwrap();
+
+        #[cfg(feature = "middleware")]
+        let client = reqwest_middleware::ClientBuilder::new(reqwest_client).build();
+
+        #[cfg(not(feature = "middleware"))]
+        let client = reqwest_client;
+
+        Self::new_with_client(baseurl, client)
     }
 
-    /// Construct a new client with an existing `reqwest::Client`,
+    /// Construct a new client with an existing client,
     /// allowing more control over its configuration.
     ///
     /// `baseurl` is the base URL provided to the internal
-    /// `reqwest::Client`, and should include a scheme and hostname,
+    /// client, and should include a scheme and hostname,
     /// as well as port and a path stem if applicable.
-    pub fn new_with_client(baseurl: &str, client: reqwest::Client) -> Self {
+    pub fn new_with_client(baseurl: &str, client: HttpClient) -> Self {
         Self {
             baseurl: baseurl.to_string(),
             client,
@@ -297377,6 +297394,7 @@ impl Client {
     }
 }
 
+#[cfg(not(feature = "middleware"))]
 impl ClientInfo<()> for Client {
     fn api_version() -> &'static str {
         "4.0"
@@ -297395,7 +297413,60 @@ impl ClientInfo<()> for Client {
     }
 }
 
+#[cfg(feature = "middleware")]
+impl Client {
+    fn api_version() -> &'static str {
+        "4.0"
+    }
+
+    fn baseurl(&self) -> &str {
+        self.baseurl.as_str()
+    }
+
+    fn client(&self) -> &HttpClient {
+        &self.client
+    }
+
+    fn inner(&self) -> &() {
+        &()
+    }
+}
+
+#[cfg(not(feature = "middleware"))]
 impl ClientHooks<()> for &Client {}
+
+#[cfg(feature = "middleware")]
+impl Client {
+    async fn pre<E>(
+        &self,
+        _request: &mut reqwest::Request,
+        _info: &OperationInfo,
+    ) -> std::result::Result<(), Error<E>> {
+        Ok(())
+    }
+
+    async fn post<E>(
+        &self,
+        _result: &Result<reqwest::Response, progenitor_client::Error<types::ErrResponse>>,
+        _info: &OperationInfo,
+    ) -> std::result::Result<(), Error<E>> {
+        Ok(())
+    }
+
+    async fn exec(
+        &self,
+        request: reqwest::Request,
+        _info: &OperationInfo,
+    ) -> Result<reqwest::Response, progenitor_client::Error<types::ErrResponse>> {
+        self.client().execute(request).await.map_err(|v| match v {
+            reqwest_middleware::Error::Reqwest(e) => progenitor_client::Error::from(e),
+            reqwest_middleware::Error::Middleware(e) => {
+                progenitor_client::Error::Custom(e.to_string())
+            }
+        })
+    }
+}
+
 impl Client {
     ///Sends a `GET` request to `/permissions`
     ///
